@@ -1,0 +1,14 @@
+{
+  "action": "opened",
+  "pull_request": {
+    "id": 42,
+    "number": 7,
+    "head": {
+      "ref": "feature/login-page",
+      "sha": "abc123def456"
+    }
+  },
+  "repository": {
+    "full_name": "org/repo-name"
+  }
+}
