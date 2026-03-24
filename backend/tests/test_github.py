@@ -1,7 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-# test webhook
 @pytest.mark.asyncio
 async def test_fetch_pr_diff():
     mock_response = MagicMock()
