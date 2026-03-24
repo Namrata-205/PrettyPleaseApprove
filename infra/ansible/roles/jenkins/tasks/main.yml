@@ -1,0 +1,127 @@
+---
+# ============================================================
+# Ansible Role: jenkins
+# Installs Jenkins LTS + Docker + configures GitHub webhook
+# ============================================================
+
+- name: Add Jenkins apt key
+  apt_key:
+    url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+    state: present
+
+- name: Add Jenkins apt repository
+  apt_repository:
+    repo: "deb https://pkg.jenkins.io/debian-stable binary/"
+    state: present
+    filename: jenkins
+
+- name: Install Java 17 (Jenkins requirement)
+  apt:
+    name: openjdk-17-jdk
+    state: present
+
+- name: Install Jenkins
+  apt:
+    name: jenkins
+    state: present
+    update_cache: yes
+
+- name: Ensure Jenkins is started and enabled
+  systemd:
+    name: jenkins
+    state: started
+    enabled: yes
+
+# ── Docker (Jenkins needs it to run pipeline agent) ──────────
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+
+- name: Install Docker Engine
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: yes
+
+- name: Add jenkins user to docker group
+  user:
+    name: jenkins
+    groups: docker
+    append: yes
+
+- name: Start and enable Docker
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+# ── Jenkins plugin list (seeded via init.groovy.d) ───────────
+
+- name: Create Jenkins init.groovy.d directory
+  file:
+    path: /var/lib/jenkins/init.groovy.d
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0750'
+
+- name: Deploy plugin install script
+  copy:
+    dest: /var/lib/jenkins/init.groovy.d/install-plugins.groovy
+    owner: jenkins
+    group: jenkins
+    mode: '0640'
+    content: |
+      import jenkins.model.*
+      import hudson.model.*
+
+      def instance = Jenkins.getInstance()
+      def pm = instance.getPluginManager()
+      def uc = instance.getUpdateCenter()
+
+      def plugins = [
+        "github",
+        "github-pullrequest",   // GitHub Pull Request Builder
+        "workflow-aggregator",  // Pipeline
+        "docker-workflow",
+        "credentials-binding",
+        "git",
+        "sonar",
+        "antisamy-markup-formatter",
+        "timestamper",
+        "ws-cleanup"
+      ]
+
+      plugins.each { pluginName ->
+        if (!pm.getPlugin(pluginName)) {
+          def plugin = uc.getPlugin(pluginName)
+          if (plugin) {
+            plugin.deploy(true)
+          }
+        }
+      }
+      instance.save()
+
+# ── Firewall ─────────────────────────────────────────────────
+
+- name: Allow Jenkins port in UFW
+  community.general.ufw:
+    rule: allow
+    port: '8080'
+    proto: tcp
+  ignore_errors: yes   # UFW may not be installed — terraform SG handles it
+
+- name: Print Jenkins initial admin password location
+  debug:
+    msg: "Retrieve initial admin password with: sudo cat /var/lib/jenkins/secrets/initialAdminPassword"

@@ -1,0 +1,44 @@
+---
+# ============================================================
+# Ansible Role: trivy
+# Installs Trivy scanner on the Jenkins host
+# ============================================================
+
+- name: Add Trivy apt key
+  apt_key:
+    url: https://aquasecurity.github.io/trivy-repo/deb/public.key
+    state: present
+
+- name: Add Trivy apt repository
+  apt_repository:
+    repo: "deb https://aquasecurity.github.io/trivy-repo/deb {{ ansible_distribution_release }} main"
+    state: present
+    filename: trivy
+
+- name: Install Trivy
+  apt:
+    name: trivy
+    state: latest
+    update_cache: yes
+
+- name: Verify Trivy installation
+  command: trivy --version
+  register: trivy_version
+  changed_when: false
+
+- name: Show Trivy version
+  debug:
+    msg: "{{ trivy_version.stdout }}"
+
+- name: Pre-warm Trivy vulnerability database
+  command: trivy image --download-db-only
+  changed_when: false
+  ignore_errors: yes   # First run may take a while; non-blocking
+
+- name: Create Trivy cache directory
+  file:
+    path: /tmp/trivy-cache
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0755'

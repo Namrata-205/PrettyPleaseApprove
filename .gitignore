@@ -1,0 +1,46 @@
+# Secrets — NEVER commit these
+.env
+*.pem
+*.key
+*secret*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+coverage.xml
+.coverage
+htmlcov/
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/*.tfvars       # contains real variable values
+infra/terraform/.terraform.lock.hcl
+
+# Trivy
+trivy-report.json
+trivy_*.deb
+
+# Docker
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SonarQube scanner cache
+.sonar/
+sonar-scanner-*/

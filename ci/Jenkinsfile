@@ -1,0 +1,230 @@
+// ============================================================
+// prettypleaseapprove — PR Review Bot Pipeline
+// Triggered by GitHub webhook on PR open/sync events
+// Stages: checkout → sonar → trivy → notify bot backend
+// ============================================================
+
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-v /var/run/docker.sock:/var/run/docker.sock -u root'
+        }
+    }
+
+    environment {
+        // GitHub credentials (stored in Jenkins credential store)
+        GITHUB_TOKEN        = credentials('github-token')
+        GITHUB_REPO         = "${env.GH_REPO ?: 'your-org/your-repo'}"
+
+        // Bot backend URL (your FastAPI service)
+        BOT_BACKEND_URL     = "${env.BOT_BACKEND_URL ?: 'http://bot-backend:8000'}"
+
+        // SonarQube
+        SONAR_HOST_URL      = "${env.SONAR_HOST_URL ?: 'http://sonarqube:9000'}"
+        SONAR_TOKEN         = credentials('sonar-token')
+        SONAR_PROJECT_KEY   = "${env.SONAR_PROJECT_KEY ?: 'pr-review-bot'}"
+
+        // Trivy
+        TRIVY_EXIT_CODE     = '0'   // Don't fail pipeline on findings; let bot handle verdict
+        TRIVY_REPORT_PATH   = 'trivy-report.json'
+
+        // PR metadata (injected by GitHub webhook plugin or manually)
+        PR_NUMBER           = "${env.PR_NUMBER ?: ''}"
+        PR_HEAD_SHA         = "${env.GIT_COMMIT ?: ''}"
+        PR_BRANCH           = "${env.CHANGE_BRANCH ?: env.GIT_BRANCH ?: 'unknown'}"
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds(abortPrevious: true)
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
+    stages {
+
+        // ── 1. CHECKOUT ──────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.PR_HEAD_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                    echo "Reviewing PR #${PR_NUMBER} @ ${env.PR_HEAD_SHA}"
+                }
+            }
+        }
+
+        // ── 2. INSTALL DEPS (for sonar/trivy to scan correctly) ──────
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    apt-get update -qq && apt-get install -y -qq curl unzip wget apt-transport-https gnupg lsb-release
+                    pip install --quiet -r backend/requirements.txt || true
+                '''
+            }
+        }
+
+        // ── 3. SONARQUBE ANALYSIS ─────────────────────────────────────
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    def sonarArgs = """
+                        -Dsonar.host.url=${SONAR_HOST_URL} \
+                        -Dsonar.login=${SONAR_TOKEN} \
+                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                        -Dsonar.projectVersion=${env.PR_HEAD_SHA?.take(7) ?: 'unknown'}
+                    """.stripIndent().trim()
+
+                    if (env.PR_NUMBER) {
+                        sonarArgs += """ \
+                            -Dsonar.pullrequest.key=${PR_NUMBER} \
+                            -Dsonar.pullrequest.branch=${PR_BRANCH} \
+                            -Dsonar.pullrequest.base=main
+                        """.stripIndent().trim()
+                    }
+
+                    // Download sonar-scanner if not present
+                    sh """
+                        if ! command -v sonar-scanner &> /dev/null; then
+                            wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+                            unzip -q sonar-scanner-cli-5.0.1.3006-linux.zip
+                            export PATH=\$PATH:\$(pwd)/sonar-scanner-5.0.1.3006-linux/bin
+                        fi
+                        sonar-scanner ${sonarArgs} -Dproject.settings=ci/sonar-project.properties
+                    """
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Fetch SonarQube quality gate result
+                        try {
+                            def sonarResponse = sh(
+                                script: """
+                                    curl -sf -u "${SONAR_TOKEN}:" \
+                                    "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+                                    || echo '{"projectStatus":{"status":"ERROR"}}'
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            env.SONAR_RESULT_JSON = sonarResponse
+                            echo "SonarQube result: ${sonarResponse}"
+                        } catch (e) {
+                            env.SONAR_RESULT_JSON = '{"projectStatus":{"status":"ERROR","errorMessage":"Could not fetch"}}'
+                            echo "Warning: Could not fetch SonarQube gate result: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. TRIVY SECURITY SCAN ────────────────────────────────────
+        stage('Trivy Security Scan') {
+            steps {
+                sh '''
+                    # Install Trivy
+                    if ! command -v trivy &> /dev/null; then
+                        wget -q https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.deb
+                        dpkg -i trivy_0.50.1_Linux-64bit.deb
+                    fi
+
+                    echo "Running Trivy filesystem scan..."
+                    trivy fs \
+                        --config ci/trivy-config.yaml \
+                        --format json \
+                        --output trivy-report.json \
+                        --exit-code 0 \
+                        .
+
+                    echo "Trivy scan complete. Results written to trivy-report.json"
+                    # Print summary to Jenkins log
+                    trivy fs \
+                        --config ci/trivy-config.yaml \
+                        --format table \
+                        --exit-code 0 \
+                        . || true
+                '''
+            }
+            post {
+                always {
+                    script {
+                        // Read trivy report for later notification
+                        try {
+                            env.TRIVY_REPORT = readFile('trivy-report.json')
+                        } catch (e) {
+                            env.TRIVY_REPORT = '[]'
+                            echo "Warning: Could not read trivy report"
+                        }
+                    }
+                    archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 5. NOTIFY BOT BACKEND ─────────────────────────────────────
+        // Bot backend does: diff fetch → Groq AI review → aggregate scores → post GitHub comment
+        stage('Trigger Bot Review') {
+            when {
+                expression { env.PR_NUMBER != '' && env.PR_NUMBER != null }
+            }
+            steps {
+                script {
+                    def payload = groovy.json.JsonOutput.toJson([
+                        pr_number      : env.PR_NUMBER?.toInteger(),
+                        repo           : env.GITHUB_REPO,
+                        head_sha       : env.PR_HEAD_SHA,
+                        branch         : env.PR_BRANCH,
+                        jenkins_build  : env.BUILD_URL,
+                        sonar_result   : env.SONAR_RESULT_JSON,
+                        trivy_report   : env.TRIVY_REPORT,
+                    ])
+
+                    writeFile file: 'bot-payload.json', text: payload
+
+                    def response = sh(
+                        script: """
+                            curl -sf -X POST \
+                              -H 'Content-Type: application/json' \
+                              -H 'X-Jenkins-Token: ${GITHUB_TOKEN}' \
+                              --data @bot-payload.json \
+                              --max-time 60 \
+                              ${BOT_BACKEND_URL}/api/v1/analysis/jenkins-callback \
+                            || echo 'BOT_CALL_FAILED'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (response == 'BOT_CALL_FAILED') {
+                        error("Bot backend did not respond — check ${BOT_BACKEND_URL} is reachable")
+                    }
+                    echo "Bot backend acknowledged: ${response}"
+                }
+            }
+        }
+    }
+
+    // ── POST ACTIONS ─────────────────────────────────────────────────
+    post {
+        success {
+            echo "✅ Pipeline complete — bot review triggered for PR #${env.PR_NUMBER}"
+        }
+        failure {
+            script {
+                if (env.PR_NUMBER) {
+                    // Post a raw failure comment if bot backend wasn't reached
+                    sh """
+                        curl -sf -X POST \
+                          -H 'Authorization: token ${GITHUB_TOKEN}' \
+                          -H 'Content-Type: application/json' \
+                          -d '{"body":"⚠️ **prettypleaseapprove** — Jenkins pipeline failed before completing review. Check build: ${env.BUILD_URL}"}' \
+                          https://api.github.com/repos/${GITHUB_REPO}/issues/${PR_NUMBER}/comments \
+                        || true
+                    """
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
