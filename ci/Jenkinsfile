@@ -1,7 +1,20 @@
 // ============================================================
-// prettypleaseapprove — PR Review Bot Pipeline
-// Triggered by GitHub webhook on PR open/sync events
-// Stages: checkout → sonar → trivy → notify bot backend
+// prettypleaseapprove — PR Review Pipeline
+// Lives in: ci/Jenkinsfile
+//
+// How to use in consumer repos:
+//   1. Copy this file to your repo at ci/Jenkinsfile
+//   2. Point your Jenkins Multibranch Pipeline job at your repo
+//   3. Set BOT_BACKEND_URL and SONAR_HOST_URL as Jenkins env vars
+//   4. Add credentials: github-token, sonar-token, bot-backend-secret
+//
+// Required Jenkins credentials (Manage Jenkins → Credentials):
+//   github-token       → GitHub PAT (repo + statuses scopes)
+//   sonar-token        → SonarQube user token
+//   bot-backend-secret → Shared secret (matches BOT_SECRET in bot's .env)
+//
+// Env vars injected automatically by GitHub Branch Source plugin:
+//   CHANGE_ID, CHANGE_BRANCH, CHANGE_TARGET, GIT_COMMIT
 // ============================================================
 
 pipeline {
@@ -13,26 +26,32 @@ pipeline {
     }
 
     environment {
-        // GitHub credentials (stored in Jenkins credential store)
+        // ── Credentials ─────────────────────────────────────────────
         GITHUB_TOKEN        = credentials('github-token')
-        GITHUB_REPO         = "${env.GH_REPO ?: 'your-org/your-repo'}"
-
-        // Bot backend URL (your FastAPI service)
-        BOT_BACKEND_URL     = "${env.BOT_BACKEND_URL ?: 'http://bot-backend:8000'}"
-
-        // SonarQube
-        SONAR_HOST_URL      = "${env.SONAR_HOST_URL ?: 'http://sonarqube:9000'}"
         SONAR_TOKEN         = credentials('sonar-token')
-        SONAR_PROJECT_KEY   = "${env.SONAR_PROJECT_KEY ?: 'pr-review-bot'}"
+        BOT_SECRET          = credentials('bot-backend-secret')
 
-        // Trivy
-        TRIVY_EXIT_CODE     = '0'   // Don't fail pipeline on findings; let bot handle verdict
-        TRIVY_REPORT_PATH   = 'trivy-report.json'
+        // ── Required env vars (no silent fallbacks) ──────────────────
+        // GH_REPO is set by the GitHub Branch Source plugin as GITHUB_REPOSITORY,
+        // or you can set GH_REPO manually on the job.
+        GITHUB_REPO         = "${env.GH_REPO ?: env.GITHUB_REPOSITORY ?: ''}"
+        BOT_BACKEND_URL     = "${env.BOT_BACKEND_URL ?: ''}"
 
-        // PR metadata (injected by GitHub webhook plugin or manually)
-        PR_NUMBER           = "${env.PR_NUMBER ?: ''}"
-        PR_HEAD_SHA         = "${env.GIT_COMMIT ?: ''}"
+        // ── PR metadata (auto-injected by GitHub Branch Source plugin) ─
+        PR_NUMBER           = "${env.CHANGE_ID ?: env.PR_NUMBER ?: ''}"
         PR_BRANCH           = "${env.CHANGE_BRANCH ?: env.GIT_BRANCH ?: 'unknown'}"
+        PR_TARGET_BRANCH    = "${env.CHANGE_TARGET ?: 'main'}"
+        PR_HEAD_SHA         = "${env.GIT_COMMIT ?: ''}"
+
+        // ── SonarQube ────────────────────────────────────────────────
+        // Project key is auto-derived from repo name in Validate stage.
+        // Set SONAR_PROJECT_KEY env var on your job to override.
+        SONAR_HOST_URL      = "${env.SONAR_HOST_URL ?: 'http://sonarqube:9000'}"
+        SONAR_PROJECT_KEY   = "${env.SONAR_PROJECT_KEY ?: ''}"
+
+        // ── Trivy ────────────────────────────────────────────────────
+        TRIVY_VERSION       = '0.50.1'
+        TRIVY_REPORT_PATH   = 'trivy-report.json'
     }
 
     options {
@@ -43,24 +62,63 @@ pipeline {
 
     stages {
 
-        // ── 1. CHECKOUT ──────────────────────────────────────────────
+        // ── 0. VALIDATE ───────────────────────────────────────────────
+        // Fail immediately with a clear message — don't waste 10 minutes
+        // before hitting an obscure curl error deep in stage 5.
+        stage('Validate Config') {
+            steps {
+                script {
+                    def missing = []
+                    if (!env.GITHUB_REPO)     missing << 'GH_REPO (or GITHUB_REPOSITORY)'
+                    if (!env.BOT_BACKEND_URL) missing << 'BOT_BACKEND_URL'
+                    if (!env.PR_NUMBER)       missing << 'PR_NUMBER (or CHANGE_ID — enable PR discovery on your Jenkins job)'
+
+                    if (missing) {
+                        error("""
+prettypleaseapprove: Missing required configuration:
+  ${missing.join('\n  ')}
+
+Fix: set these as environment variables on your Jenkins job,
+or enable the GitHub Branch Source plugin which injects them automatically.
+Docs: https://github.com/Namrata-205/PrettyPleaseApprove#setup
+                        """.stripIndent().trim())
+                    }
+
+                    // Auto-derive SonarQube project key from repo name if not set.
+                    // "acme-org/payments-api" → "acme-org-payments-api"
+                    // This ensures every consumer repo gets its own SonarQube project.
+                    if (!env.SONAR_PROJECT_KEY) {
+                        env.SONAR_PROJECT_KEY = env.GITHUB_REPO
+                            .replaceAll('/', '-')
+                            .replaceAll('[^a-zA-Z0-9_\\-.]', '')
+                    }
+
+                    echo "✅ Config OK"
+                    echo "   Repo:        ${env.GITHUB_REPO}"
+                    echo "   PR:          #${env.PR_NUMBER} (${env.PR_BRANCH} → ${env.PR_TARGET_BRANCH})"
+                    echo "   Sonar key:   ${env.SONAR_PROJECT_KEY}"
+                    echo "   Bot backend: ${env.BOT_BACKEND_URL}"
+                }
+            }
+        }
+
+        // ── 1. CHECKOUT ───────────────────────────────────────────────
         stage('Checkout') {
             steps {
                 checkout scm
                 script {
                     env.PR_HEAD_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-                    echo "Reviewing PR #${PR_NUMBER} @ ${env.PR_HEAD_SHA}"
+                    echo "Reviewing PR #${env.PR_NUMBER} @ ${env.PR_HEAD_SHA}"
                 }
             }
         }
 
-        // ── 2. INSTALL DEPS (for sonar/trivy to scan correctly) ──────
-        stage('Install Dependencies') {
+        // ── 2. INSTALL TOOLING ────────────────────────────────────────
+        // Installs system tools only. Does NOT install the consumer repo's
+        // own dependencies — that belongs in the repo's own CI pipeline.
+        stage('Install Tooling') {
             steps {
-                sh '''
-                    apt-get update -qq && apt-get install -y -qq curl unzip wget apt-transport-https gnupg lsb-release
-                    pip install --quiet -r backend/requirements.txt || true
-                '''
+                sh 'apt-get update -qq && apt-get install -y -qq curl unzip wget apt-transport-https gnupg lsb-release jq'
             }
         }
 
@@ -68,50 +126,62 @@ pipeline {
         stage('SonarQube Analysis') {
             steps {
                 script {
-                    def sonarArgs = """
-                        -Dsonar.host.url=${SONAR_HOST_URL} \
-                        -Dsonar.login=${SONAR_TOKEN} \
-                        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-                        -Dsonar.projectVersion=${env.PR_HEAD_SHA?.take(7) ?: 'unknown'}
-                    """.stripIndent().trim()
+                    def sonarArgs = [
+                        "-Dsonar.host.url=${env.SONAR_HOST_URL}",
+                        "-Dsonar.login=${env.SONAR_TOKEN}",
+                        "-Dsonar.projectKey=${env.SONAR_PROJECT_KEY}",
+                        "-Dsonar.projectName=${env.GITHUB_REPO}",
+                        "-Dsonar.projectVersion=${env.PR_HEAD_SHA?.take(7) ?: 'unknown'}",
+                        "-Dsonar.pullrequest.key=${env.PR_NUMBER}",
+                        "-Dsonar.pullrequest.branch=${env.PR_BRANCH}",
+                        "-Dsonar.pullrequest.base=${env.PR_TARGET_BRANCH}",
+                    ].join(' \\\n        ')
 
-                    if (env.PR_NUMBER) {
-                        sonarArgs += """ \
-                            -Dsonar.pullrequest.key=${PR_NUMBER} \
-                            -Dsonar.pullrequest.branch=${PR_BRANCH} \
-                            -Dsonar.pullrequest.base=main
-                        """.stripIndent().trim()
-                    }
-
-                    // Download sonar-scanner if not present
                     sh """
                         if ! command -v sonar-scanner &> /dev/null; then
                             wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
                             unzip -q sonar-scanner-cli-5.0.1.3006-linux.zip
-                            export PATH=\$PATH:\$(pwd)/sonar-scanner-5.0.1.3006-linux/bin
+                            ln -sf \$(pwd)/sonar-scanner-5.0.1.3006-linux/bin/sonar-scanner /usr/local/bin/sonar-scanner
                         fi
-                        sonar-scanner ${sonarArgs} -Dproject.settings=ci/sonar-project.properties
+
+                        # Use repo's own sonar config if present; fall back to ours in ci/
+                        PROPS_ARG=""
+                        if [ -f "sonar-project.properties" ]; then
+                            PROPS_ARG="-Dproject.settings=sonar-project.properties"
+                            echo "Using sonar-project.properties from repo root"
+                        elif [ -f "ci/sonar-project.properties" ]; then
+                            PROPS_ARG="-Dproject.settings=ci/sonar-project.properties"
+                            echo "Using ci/sonar-project.properties"
+                        else
+                            echo "No sonar-project.properties found — using scanner defaults"
+                        fi
+
+                        sonar-scanner ${sonarArgs} \$PROPS_ARG
                     """
                 }
             }
             post {
                 always {
                     script {
-                        // Fetch SonarQube quality gate result
                         try {
+                            sleep(time: 5, unit: 'SECONDS')
                             def sonarResponse = sh(
                                 script: """
-                                    curl -sf -u "${SONAR_TOKEN}:" \
-                                    "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
-                                    || echo '{"projectStatus":{"status":"ERROR"}}'
+                                    curl -sf -u "${env.SONAR_TOKEN}:" \
+                                    "${env.SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${env.SONAR_PROJECT_KEY}" \
+                                    || echo '{"projectStatus":{"status":"ERROR","conditions":[]}}'
                                 """,
                                 returnStdout: true
                             ).trim()
                             env.SONAR_RESULT_JSON = sonarResponse
-                            echo "SonarQube result: ${sonarResponse}"
+                            def gateStatus = sh(
+                                script: "echo '${sonarResponse}' | jq -r '.projectStatus.status'",
+                                returnStdout: true
+                            ).trim()
+                            echo "SonarQube quality gate: ${gateStatus}"
                         } catch (e) {
-                            env.SONAR_RESULT_JSON = '{"projectStatus":{"status":"ERROR","errorMessage":"Could not fetch"}}'
-                            echo "Warning: Could not fetch SonarQube gate result: ${e.message}"
+                            env.SONAR_RESULT_JSON = '{"projectStatus":{"status":"ERROR","conditions":[]}}'
+                            echo "Warning: could not fetch SonarQube gate — ${e.message}"
                         }
                     }
                 }
@@ -121,39 +191,43 @@ pipeline {
         // ── 4. TRIVY SECURITY SCAN ────────────────────────────────────
         stage('Trivy Security Scan') {
             steps {
-                sh '''
-                    # Install Trivy
+                sh """
                     if ! command -v trivy &> /dev/null; then
-                        wget -q https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.deb
-                        dpkg -i trivy_0.50.1_Linux-64bit.deb
+                        wget -q https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.deb
+                        dpkg -i trivy_${TRIVY_VERSION}_Linux-64bit.deb
                     fi
 
-                    echo "Running Trivy filesystem scan..."
+                    # Use repo's own trivy config if present, otherwise ci/ default
+                    CONFIG_ARG=""
+                    if [ -f ".trivy.yaml" ]; then
+                        CONFIG_ARG="--config .trivy.yaml"
+                        echo "Using .trivy.yaml from repo root"
+                    elif [ -f "ci/trivy-config.yaml" ]; then
+                        CONFIG_ARG="--config ci/trivy-config.yaml"
+                        echo "Using ci/trivy-config.yaml"
+                    else
+                        echo "No trivy config found — using scanner defaults"
+                    fi
+
                     trivy fs \
-                        --config ci/trivy-config.yaml \
+                        \$CONFIG_ARG \
                         --format json \
-                        --output trivy-report.json \
+                        --output ${TRIVY_REPORT_PATH} \
                         --exit-code 0 \
                         .
 
-                    echo "Trivy scan complete. Results written to trivy-report.json"
-                    # Print summary to Jenkins log
-                    trivy fs \
-                        --config ci/trivy-config.yaml \
-                        --format table \
-                        --exit-code 0 \
-                        . || true
-                '''
+                    trivy fs \$CONFIG_ARG --format table --exit-code 0 . || true
+                    echo "Trivy scan complete."
+                """
             }
             post {
                 always {
                     script {
-                        // Read trivy report for later notification
                         try {
-                            env.TRIVY_REPORT = readFile('trivy-report.json')
+                            env.TRIVY_REPORT = readFile(env.TRIVY_REPORT_PATH)
                         } catch (e) {
-                            env.TRIVY_REPORT = '[]'
-                            echo "Warning: Could not read trivy report"
+                            env.TRIVY_REPORT = '{"Results":[]}'
+                            echo "Warning: could not read trivy report — ${e.message}"
                         }
                     }
                     archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
@@ -161,22 +235,21 @@ pipeline {
             }
         }
 
-        // ── 5. NOTIFY BOT BACKEND ─────────────────────────────────────
-        // Bot backend does: diff fetch → Groq AI review → aggregate scores → post GitHub comment
+        // ── 5. TRIGGER BOT REVIEW ─────────────────────────────────────
+        // Sends scan results to the bot backend.
+        // Bot backend: fetches diff → AI review → scores → posts GitHub comment.
         stage('Trigger Bot Review') {
-            when {
-                expression { env.PR_NUMBER != '' && env.PR_NUMBER != null }
-            }
             steps {
                 script {
                     def payload = groovy.json.JsonOutput.toJson([
-                        pr_number      : env.PR_NUMBER?.toInteger(),
-                        repo           : env.GITHUB_REPO,
-                        head_sha       : env.PR_HEAD_SHA,
-                        branch         : env.PR_BRANCH,
-                        jenkins_build  : env.BUILD_URL,
-                        sonar_result   : env.SONAR_RESULT_JSON,
-                        trivy_report   : env.TRIVY_REPORT,
+                        pr_number       : env.PR_NUMBER?.toInteger(),
+                        repo            : env.GITHUB_REPO,
+                        head_sha        : env.PR_HEAD_SHA,
+                        branch          : env.PR_BRANCH,
+                        target_branch   : env.PR_TARGET_BRANCH,
+                        jenkins_build   : env.BUILD_URL,
+                        sonar_result    : env.SONAR_RESULT_JSON ?: '{}',
+                        trivy_report    : env.TRIVY_REPORT ?: '{"Results":[]}',
                     ])
 
                     writeFile file: 'bot-payload.json', text: payload
@@ -185,38 +258,36 @@ pipeline {
                         script: """
                             curl -sf -X POST \
                               -H 'Content-Type: application/json' \
-                              -H 'X-Jenkins-Token: ${GITHUB_TOKEN}' \
+                              -H 'X-Bot-Secret: ${BOT_SECRET}' \
                               --data @bot-payload.json \
-                              --max-time 60 \
-                              ${BOT_BACKEND_URL}/api/v1/analysis/jenkins-callback \
+                              --max-time 120 \
+                              ${BOT_BACKEND_URL}/webhook/jenkins-callback \
                             || echo 'BOT_CALL_FAILED'
                         """,
                         returnStdout: true
                     ).trim()
 
                     if (response == 'BOT_CALL_FAILED') {
-                        error("Bot backend did not respond — check ${BOT_BACKEND_URL} is reachable")
+                        error("Bot backend unreachable at ${env.BOT_BACKEND_URL} — is it running?")
                     }
-                    echo "Bot backend acknowledged: ${response}"
+                    echo "Bot backend response: ${response}"
                 }
             }
         }
     }
 
-    // ── POST ACTIONS ─────────────────────────────────────────────────
     post {
         success {
-            echo "✅ Pipeline complete — bot review triggered for PR #${env.PR_NUMBER}"
+            echo "✅ Pipeline complete — review triggered for PR #${env.PR_NUMBER} on ${env.GITHUB_REPO}"
         }
         failure {
             script {
-                if (env.PR_NUMBER) {
-                    // Post a raw failure comment if bot backend wasn't reached
+                if (env.PR_NUMBER && env.GITHUB_REPO) {
                     sh """
                         curl -sf -X POST \
                           -H 'Authorization: token ${GITHUB_TOKEN}' \
                           -H 'Content-Type: application/json' \
-                          -d '{"body":"⚠️ **prettypleaseapprove** — Jenkins pipeline failed before completing review. Check build: ${env.BUILD_URL}"}' \
+                          -d '{"body":"⚠️ **prettypleaseapprove** — Jenkins pipeline failed before completing the review.\\n\\nBuild log: ${env.BUILD_URL}"}' \
                           https://api.github.com/repos/${GITHUB_REPO}/issues/${PR_NUMBER}/comments \
                         || true
                     """

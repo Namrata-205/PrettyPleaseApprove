@@ -1,6 +1,6 @@
 # ============================================================
-# prettypleaseapprove — Local Dev / Staging Docker Compose
-# Services: bot-backend, redis (job queue), postgres (bot DB)
+# prettypleaseapprove — Docker Compose
+# Services: bot-backend, postgres, redis, prometheus, grafana
 # Jenkins + SonarQube run separately (see infra/ansible)
 # ============================================================
 
@@ -8,7 +8,6 @@ version: "3.8"
 
 services:
 
-  # ── Bot Backend (FastAPI) ─────────────────────────────────
   bot-backend:
     build:
       context: ./backend
@@ -18,8 +17,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://botuser:botpassword@postgres:5432/botdb
-      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://botuser:botpassword@postgres:5432/botdb
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
       - GROQ_API_KEY=${GROQ_API_KEY}
@@ -28,14 +26,15 @@ services:
       - JENKINS_TOKEN=${JENKINS_TOKEN}
       - SONAR_HOST_URL=${SONAR_HOST_URL}
       - SONAR_TOKEN=${SONAR_TOKEN}
+      # Shared secret — must match 'bot-backend-secret' Jenkins credential
+      - BOT_SECRET=${BOT_SECRET}
+      - APP_ENV=${APP_ENV:-production}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
-    volumes:
-      - ./backend:/app   # hot-reload in dev; remove in prod
     networks:
       - bot-network
     healthcheck:
@@ -44,7 +43,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # ── PostgreSQL (bot state DB) ─────────────────────────────
   postgres:
     image: postgres:15-alpine
     container_name: bot-postgres
@@ -63,7 +61,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Redis (job queue / caching) ───────────────────────────
   redis:
     image: redis:7-alpine
     container_name: bot-redis
@@ -74,7 +71,6 @@ services:
     networks:
       - bot-network
 
-  # ── Prometheus (metrics scraping) ────────────────────────
   prometheus:
     image: prom/prometheus:latest
     container_name: bot-prometheus
@@ -91,7 +87,6 @@ services:
     networks:
       - bot-network
 
-  # ── Grafana (dashboards) ──────────────────────────────────
   grafana:
     image: grafana/grafana:latest
     container_name: bot-grafana
