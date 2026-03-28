@@ -1,0 +1,93 @@
+---
+# ============================================================
+# prettypleaseapprove — Master Ansible Playbook
+# Run: ansible-playbook -i inventory.ini playbook.yml
+# ============================================================
+
+- name: Apply common baseline to all hosts
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - unzip
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - lsb-release
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: Set timezone to UTC
+      timezone:
+        name: UTC
+
+    - name: Create /opt/prettypleaseapprove directory
+      file:
+        path: /opt/prettypleaseapprove
+        state: directory
+        mode: '0755'
+
+# ── Jenkins ──────────────────────────────────────────────────
+- name: Configure Jenkins server
+  hosts: jenkins
+  become: true
+  roles:
+    - jenkins
+
+# ── SonarQube ─────────────────────────────────────────────────
+- name: Configure SonarQube server
+  hosts: sonarqube
+  become: true
+  roles:
+    - sonarqube
+
+# ── Trivy (installed on Jenkins — scanner runs there) ────────
+- name: Install Trivy on Jenkins host
+  hosts: jenkins
+  become: true
+  roles:
+    - trivy
+
+# ── Bot Backend ───────────────────────────────────────────────
+- name: Deploy bot backend (FastAPI)
+  hosts: bot_backend
+  become: true
+  tasks:
+    - name: Install Docker
+      include_tasks: roles/jenkins/tasks/docker.yml
+
+    - name: Copy backend source
+      synchronize:
+        src: "{{ playbook_dir }}/../../backend/"
+        dest: /opt/prettypleaseapprove/backend/
+        rsync_opts:
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.env"
+
+    - name: Copy .env file
+      template:
+        src: "{{ playbook_dir }}/../../.env.example"
+        dest: /opt/prettypleaseapprove/backend/.env
+        mode: '0600'
+
+    - name: Build and start bot backend container
+      community.docker.docker_compose_v2:
+        project_src: /opt/prettypleaseapprove
+        files:
+          - "{{ playbook_dir }}/../../docker-compose.yml"
+        services:
+          - bot-backend
+        state: present
+        pull: always

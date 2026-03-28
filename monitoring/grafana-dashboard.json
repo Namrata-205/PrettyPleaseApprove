@@ -1,0 +1,67 @@
+{
+  "title": "prettypleaseapprove — PR Review Bot",
+  "uid": "pr-review-bot",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "PRs Reviewed (last 24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "increase(pr_reviews_total[24h])",
+          "legendFormat": "PRs reviewed"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Blocked vs Approved",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "pr_verdict_total{verdict='blocked'}", "legendFormat": "Blocked" },
+        { "expr": "pr_verdict_total{verdict='approved'}", "legendFormat": "Approved" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Review Latency (p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job='bot-backend'}[5m]))",
+          "legendFormat": "p95 latency (s)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Webhook Requests/min",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(http_requests_total{job='bot-backend', path='/api/v1/webhook/github'}[1m]) * 60",
+          "legendFormat": "webhooks/min"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(http_requests_total{job='bot-backend', status=~'5..'}[5m])",
+          "legendFormat": "5xx errors/s"
+        }
+      ]
+    }
+  ]
+}

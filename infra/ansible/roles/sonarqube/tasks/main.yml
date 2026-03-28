@@ -1,0 +1,132 @@
+---
+# ============================================================
+# Ansible Role: sonarqube
+# Installs SonarQube Community via Docker Compose
+# Includes PostgreSQL as the backing DB
+# ============================================================
+
+- name: Set vm.max_map_count for Elasticsearch (SonarQube requirement)
+  sysctl:
+    name: vm.max_map_count
+    value: '524288'
+    state: present
+    reload: yes
+
+- name: Set fs.file-max
+  sysctl:
+    name: fs.file-max
+    value: '131072'
+    state: present
+    reload: yes
+
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+
+- name: Install Docker Engine
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: yes
+
+- name: Start and enable Docker
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Create SonarQube directory
+  file:
+    path: /opt/sonarqube
+    state: directory
+    mode: '0755'
+
+- name: Deploy SonarQube docker-compose
+  copy:
+    dest: /opt/sonarqube/docker-compose.yml
+    mode: '0644'
+    content: |
+      version: "3.8"
+      services:
+        sonarqube:
+          image: sonarqube:10-community
+          container_name: sonarqube
+          restart: unless-stopped
+          depends_on:
+            - sonarqube-db
+          environment:
+            SONAR_JDBC_URL: jdbc:postgresql://sonarqube-db:5432/sonar
+            SONAR_JDBC_USERNAME: sonar
+            SONAR_JDBC_PASSWORD: sonar_password_change_me
+          volumes:
+            - sonarqube_data:/opt/sonarqube/data
+            - sonarqube_logs:/opt/sonarqube/logs
+            - sonarqube_extensions:/opt/sonarqube/extensions
+          ports:
+            - "9000:9000"
+          ulimits:
+            nofile:
+              soft: 65536
+              hard: 65536
+
+        sonarqube-db:
+          image: postgres:15
+          container_name: sonarqube-db
+          restart: unless-stopped
+          environment:
+            POSTGRES_USER: sonar
+            POSTGRES_PASSWORD: sonar_password_change_me
+            POSTGRES_DB: sonar
+          volumes:
+            - sonarqube_postgresql:/var/lib/postgresql
+            - sonarqube_postgresql_data:/var/lib/postgresql/data
+
+      volumes:
+        sonarqube_data:
+        sonarqube_logs:
+        sonarqube_extensions:
+        sonarqube_postgresql:
+        sonarqube_postgresql_data:
+
+- name: Start SonarQube
+  community.docker.docker_compose_v2:
+    project_src: /opt/sonarqube
+    state: present
+
+- name: Wait for SonarQube to be ready
+  uri:
+    url: "http://localhost:9000/api/system/status"
+    method: GET
+    status_code: 200
+    return_content: yes
+  register: sonar_status
+  until: "'UP' in sonar_status.content"
+  retries: 30
+  delay: 10
+
+- name: Create prettypleaseapprove quality gate
+  uri:
+    url: "http://localhost:9000/api/qualitygates/create"
+    method: POST
+    user: admin
+    password: admin
+    force_basic_auth: yes
+    body_format: form-urlencoded
+    body:
+      name: prettypleaseapprove-gate
+    status_code: [200, 400]   # 400 = already exists, that's fine
+  ignore_errors: yes
+
+- name: Print SonarQube access info
+  debug:
+    msg: "SonarQube running at http://{{ ansible_host }}:9000 — default credentials: admin/admin (change immediately)"

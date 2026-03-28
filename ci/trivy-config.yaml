@@ -1,0 +1,71 @@
+# ============================================================
+# Trivy configuration for prettypleaseapprove PR Review Bot
+# Docs: https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+# ============================================================
+
+# ── Scan targets ─────────────────────────────────────────────
+# The Jenkinsfile runs: trivy fs --config ci/trivy-config.yaml .
+# This file controls what/how to scan.
+
+scan:
+  # Scan these vulnerability types
+  vuln-type:
+    - os
+    - library
+
+  # Only report these severities (UNKNOWN is noise; adjust as needed)
+  severity:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+
+  # Fail the scan only on CRITICAL (Jenkinsfile uses --exit-code 0 anyway,
+  # so bot backend makes the final verdict)
+  exit-code: 0
+
+  # Include unfixed vulns in output (bot will flag them as informational)
+  ignore-unfixed: false
+
+# ── Output ───────────────────────────────────────────────────
+format: json
+output: trivy-report.json
+
+# ── Filesystem scan options ───────────────────────────────────
+fs:
+  # Scan these artifact types when doing `trivy fs`
+  scanners:
+    - vuln          # known CVEs in dependencies
+    - secret        # hardcoded secrets / API keys
+    - misconfig     # IaC misconfigurations (Dockerfile, terraform, etc.)
+
+# ── Secret scanning ───────────────────────────────────────────
+secret:
+  config: ci/.trivysecret.yaml    # optional: custom rules (see below)
+
+# ── Misconfig scanning ────────────────────────────────────────
+misconfig:
+  # Include Dockerfile, docker-compose, and terraform checks
+  include-non-failures: false
+
+# ── Paths to ignore ───────────────────────────────────────────
+# Add paths you don't want scanned (test fixtures, mocks, etc.)
+skip-dirs:
+  - .git
+  - .venv
+  - node_modules
+  - "**/__pycache__"
+
+skip-files:
+  - "**/*.pyc"
+  - "**/*.lock"    # poetry/pip lock files have many false positives — remove if you want dep scans
+
+# ── Cache ─────────────────────────────────────────────────────
+cache:
+  dir: /tmp/trivy-cache
+  backend: fs
+
+# ── DB ────────────────────────────────────────────────────────
+db:
+  # Auto-download latest vuln DB; set no-update: true in air-gapped envs
+  no-update: false
+  skip-update: false

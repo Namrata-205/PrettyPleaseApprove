@@ -21,10 +21,14 @@ class Settings(BaseSettings):
     jenkins_token: str = ""
     jenkins_job_name: str = ""
 
+    # Bot backend auth
+    # Must match the 'bot-backend-secret' Jenkins credential value.
+    # If empty, auth is skipped (dev mode only — never leave empty in prod).
+    bot_secret: str = ""
+
     # Database
     database_url: str = "sqlite+aiosqlite:///./local.db"
 
-    # ✅ NEW STYLE (replaces class Config)
     model_config = ConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"
